@@ -78,6 +78,21 @@
     return rect.width > 0 && rect.height > 0
   }
 
+  function intersectsViewport(element) {
+    if (!isVisible(element)) {
+      return false
+    }
+
+    const rect = element.getBoundingClientRect()
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight
+
+    return rect.bottom > 0
+      && rect.right > 0
+      && rect.top < viewportHeight
+      && rect.left < viewportWidth
+  }
+
   function cleanBlockText(value, maxLength = 12000) {
     const text = normalizeText(value)
 
@@ -174,6 +189,11 @@
       if (action === 'choose-issue' && url) {
         navigateToIssue(url)
       }
+
+      if (action === 'choose-timeline-selection') {
+        const selectionIndex = Number(button.dataset.selectionIndex)
+        void chooseTimelineSelection(selectionIndex)
+      }
     })
 
     state.ui = ui
@@ -262,6 +282,35 @@
                   </div>
                   <button class="buggag-button" type="button" data-action="choose-issue" data-url="${escapeHtml(issue.url)}">
                     Open and build prompt
+                  </button>
+                </li>
+              `,
+            )
+            .join('')}
+        </ul>
+      </div>
+    `
+  }
+
+  function renderTimelineSelectionChooser(selections) {
+    const ui = ensureUi()
+    setBodyMode('chooser')
+    setHeader('Pick an expanded issue', 'More than one timeline event is open. Choose the one BugGag should use, and it will collapse the others first.')
+
+    ui.body.innerHTML = `
+      <div class="buggag-chooser">
+        <p class="buggag-chooser-copy">BugGag found ${selections.length} expanded timeline selection${selections.length === 1 ? '' : 's'}.</p>
+        <ul class="buggag-issue-list">
+          ${selections
+            .map(
+              (selection, index) => `
+                <li class="buggag-issue-row">
+                  <div>
+                    <p class="buggag-issue-title">${escapeHtml(selection.title)}</p>
+                    <p class="buggag-issue-url">${escapeHtml(selection.subtitle || selection.url || 'Current timeline selection')}</p>
+                  </div>
+                  <button class="buggag-button" type="button" data-action="choose-timeline-selection" data-selection-index="${index}">
+                    Use this selection
                   </button>
                 </li>
               `,
@@ -368,7 +417,114 @@
       .filter(Boolean)
   }
 
+  function getExpandedTimelineSummaryRows({ viewportOnly = false } = {}) {
+    return [...document.querySelectorAll('tr.EventsTable-row.DataTable-row--inlineDetailRow')]
+      .filter((row) => isVisible(row) && (!viewportOnly || intersectsViewport(row)))
+  }
+
+  function getTimelineDetailRowForSummaryRow(summaryRow) {
+    if (!summaryRow) {
+      return null
+    }
+
+    if (summaryRow.matches?.('tr.DataTable-inlineDetail')) {
+      return summaryRow
+    }
+
+    return summaryRow.closest?.('tr.DataTable-inlineDetail')
+      || (summaryRow.nextElementSibling?.matches?.('tr.DataTable-inlineDetail') ? summaryRow.nextElementSibling : null)
+      || null
+  }
+
+  function getInlineTimelineDetailRow() {
+    const visibleSummaryRow = getExpandedTimelineSummaryRows({ viewportOnly: true })[0]
+
+    if (visibleSummaryRow) {
+      return getTimelineDetailRowForSummaryRow(visibleSummaryRow) || visibleSummaryRow
+    }
+
+    const anySummaryRow = getExpandedTimelineSummaryRows()[0]
+
+    if (anySummaryRow) {
+      return getTimelineDetailRowForSummaryRow(anySummaryRow) || anySummaryRow
+    }
+
+    return [...document.querySelectorAll('tr.DataTable-inlineDetail')].find(isVisible) || null
+  }
+
+  function getInlineTimelineSummaryRow(container = null) {
+    const detailRow = container?.matches?.('tr.DataTable-inlineDetail')
+      ? container
+      : container?.closest?.('tr.DataTable-inlineDetail') || getInlineTimelineDetailRow()
+
+    if (!detailRow) {
+      return getExpandedTimelineSummaryRows({ viewportOnly: true })[0]
+        || getExpandedTimelineSummaryRows()[0]
+        || null
+    }
+
+    const nestedSummaryRow = detailRow.querySelector('tr.EventsTable-row.DataTable-row--inlineDetailRow')
+
+    if (nestedSummaryRow) {
+      return nestedSummaryRow
+    }
+
+    let current = detailRow.previousElementSibling
+
+    while (current) {
+      if (current.matches?.('tr.EventsTable-row')) {
+        return current
+      }
+
+      current = current.previousElementSibling
+    }
+
+    return null
+  }
+
+  function getTimelineSelectionSubtitle(container) {
+    const summaryRow = getInlineTimelineSummaryRow(container)
+    const lines = normalizeText(
+      summaryRow?.querySelector('.DataTable-primaryContent')?.innerText
+        || summaryRow?.innerText
+        || '',
+    )
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    if (lines.length <= 1) {
+      return ''
+    }
+
+    return cleanBlockText(lines.slice(1, 3).join(' - '), 180)
+  }
+
+  function collectExpandedTimelineSelections() {
+    const summaryRows = getExpandedTimelineSummaryRows({ viewportOnly: true })
+    const candidates = summaryRows.length ? summaryRows : getExpandedTimelineSummaryRows()
+
+    return candidates
+      .map((summaryRow) => {
+        const detailRow = getTimelineDetailRowForSummaryRow(summaryRow) || summaryRow
+
+        return {
+          detailRow,
+          summaryRow,
+          title: getTimelineSelectionTitle(detailRow) || 'Expanded issue',
+          subtitle: getTimelineSelectionSubtitle(detailRow),
+          url: getTimelineSelectionUrl(detailRow),
+        }
+      })
+  }
+
   function getExpandedTimelineContainer() {
+    const inlineDetailRow = getInlineTimelineDetailRow()
+
+    if (inlineDetailRow) {
+      return inlineDetailRow
+    }
+
     const controls = [...document.querySelectorAll('button, [role="tab"], summary, a')].filter(
       (element) => isVisible(element) && matchesAny(element.innerText || element.textContent, ['stacktrace']),
     )
@@ -397,22 +553,77 @@
     return Boolean(getExpandedTimelineContainer())
   }
 
-  function getTimelineSelectionIssueLink(container) {
-    const scopedAnchor = container?.querySelector('a[href*="/errors/"]')
+  function getTimelineSelectionReferenceNode(container) {
+    if (!container) {
+      return null
+    }
 
-    if (scopedAnchor?.href) {
-      return {
-        url: canonicalizeUrl(scopedAnchor.href),
-        title: cleanBlockText(scopedAnchor.innerText || scopedAnchor.textContent || '', 240),
+    const summaryRow = getInlineTimelineSummaryRow(container)
+
+    if (summaryRow) {
+      return summaryRow
+    }
+
+    const preferredSelectors = [
+      '[role="tablist"]',
+      '[role="tab"][aria-selected="true"]',
+      'button[aria-selected="true"]',
+      'pre',
+      'code',
+    ]
+
+    for (const selector of preferredSelectors) {
+      const match = [...container.querySelectorAll(selector)].find(isVisible)
+
+      if (match) {
+        return match
       }
     }
 
-    const visibleAnchor = collectIssueLinks().find((issue) => container?.contains(issue.anchor))
+    return [...container.querySelectorAll('button, [role="tab"], summary, div, section')].find(
+      (element) => isVisible(element) && /raw view/i.test(element.innerText || element.textContent || ''),
+    ) || null
+  }
 
-    if (visibleAnchor) {
+  function getTimelineSelectionIssueLink(container) {
+    if (!container) {
+      return null
+    }
+
+    const scopedAnchors = collectIssueLinks(container)
+
+    if (!scopedAnchors.length) {
+      return null
+    }
+
+    if (scopedAnchors.length === 1) {
       return {
-        url: visibleAnchor.url,
-        title: cleanBlockText(visibleAnchor.title, 240),
+        url: scopedAnchors[0].url,
+        title: cleanBlockText(scopedAnchors[0].title, 240),
+      }
+    }
+
+    const referenceNode = getTimelineSelectionReferenceNode(container)
+
+    if (!referenceNode) {
+      const fallbackAnchor = scopedAnchors[scopedAnchors.length - 1]
+      return {
+        url: fallbackAnchor.url,
+        title: cleanBlockText(fallbackAnchor.title, 240),
+      }
+    }
+
+    const precedingAnchors = scopedAnchors.filter(({ anchor }) => {
+      const position = anchor.compareDocumentPosition(referenceNode)
+      return position === 0 || Boolean(position & Node.DOCUMENT_POSITION_FOLLOWING)
+    })
+
+    const matchedAnchor = precedingAnchors[precedingAnchors.length - 1] || scopedAnchors[0]
+
+    if (matchedAnchor) {
+      return {
+        url: matchedAnchor.url,
+        title: cleanBlockText(matchedAnchor.title, 240),
       }
     }
 
@@ -436,6 +647,17 @@
   function getTimelineSelectionTitle(container) {
     if (!container) {
       return ''
+    }
+
+    const summaryRow = getInlineTimelineSummaryRow(container)
+    const summaryTitle = cleanTimelineTitleCandidate(
+      summaryRow?.querySelector('.DataTable-primaryContent')?.innerText
+        || summaryRow?.innerText
+        || '',
+    )
+
+    if (summaryTitle) {
+      return summaryTitle
     }
 
     const linkedTitle = cleanTimelineTitleCandidate(getTimelineSelectionIssueLink(container)?.title || '')
@@ -1195,6 +1417,48 @@
     return null
   }
 
+  async function chooseTimelineSelection(selectionIndex) {
+    const selections = collectExpandedTimelineSelections()
+    const target = selections[selectionIndex]
+
+    if (!target?.summaryRow) {
+      renderError('Selection disappeared', 'BugGag could not find that expanded timeline issue anymore. Reopen it and try again.')
+      return
+    }
+
+    renderLoading('Focusing your selection', 'BugGag is collapsing the other open timeline items so it can read the one you picked cleanly.')
+
+    for (const selection of selections) {
+      if (selection.summaryRow === target.summaryRow || !selection.summaryRow?.isConnected) {
+        continue
+      }
+
+      selection.summaryRow.click()
+      await sleep(180)
+    }
+
+    let container = await waitForTimelineSelection(1200)
+    let activeSummaryRow = getInlineTimelineSummaryRow(container)
+
+    if (activeSummaryRow !== target.summaryRow && target.summaryRow.isConnected) {
+      target.summaryRow.click()
+      await sleep(220)
+      container = await waitForTimelineSelection(1200)
+      activeSummaryRow = getInlineTimelineSummaryRow(container)
+    }
+
+    if (!container || activeSummaryRow !== target.summaryRow) {
+      renderError('Unable to isolate selection', 'BugGag could not narrow the timeline to the issue you picked. Collapse the others manually and try again.')
+      return
+    }
+
+    await captureCurrentIssue({
+      announce: false,
+      titleOverride: getTimelineSelectionTitle(container),
+      urlOverride: getTimelineSelectionUrl(container),
+    })
+  }
+
   async function captureCurrentIssue({ announce = true, titleOverride = '', urlOverride = '' } = {}) {
     if (announce) {
       openModal()
@@ -1279,6 +1543,14 @@
     }
 
     if (pageType === 'timeline') {
+      const expandedSelections = collectExpandedTimelineSelections()
+
+      if (expandedSelections.length > 1) {
+        openModal()
+        renderTimelineSelectionChooser(expandedSelections)
+        return { ok: true, pageType }
+      }
+
       const container = await waitForTimelineSelection(1200)
 
       if (container) {

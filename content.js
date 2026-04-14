@@ -1033,6 +1033,79 @@
     return FALLBACK_NOISE_PATTERNS.some((pattern) => pattern.test(normalized))
   }
 
+  function discoverUnvisitedSectionLabels() {
+    const allMatchers = SECTION_DEFS.flatMap((def) => def.matchers)
+
+    const knownControls = [...document.querySelectorAll('button, [role="tab"], summary')]
+      .filter((element) => isVisible(element) && matchesAny(element.innerText || element.textContent, allMatchers))
+
+    // Need at least 2 known tabs to confirm we are looking at a tabbed section layout.
+    if (knownControls.length < 2) {
+      return []
+    }
+
+    const containers = new Set()
+
+    for (const control of knownControls) {
+      const tablist = control.closest('[role="tablist"]')
+      containers.add(tablist || control.parentElement)
+    }
+
+    const seen = new Set()
+    const labels = []
+
+    for (const container of containers) {
+      if (!container) {
+        continue
+      }
+
+      const controls = [...container.querySelectorAll('button, [role="tab"], summary')].filter(isVisible)
+
+      for (const control of controls) {
+        const label = normalizeText(control.innerText || control.textContent)
+
+        if (!label || label.length > 40 || label.length < 2) {
+          continue
+        }
+
+        if (matchesAny(label, allMatchers)) {
+          continue
+        }
+
+        if (FALLBACK_NOISE_PATTERNS.some((pattern) => pattern.test(label))) {
+          continue
+        }
+
+        const key = normalizeKey(label)
+
+        if (seen.has(key)) {
+          continue
+        }
+
+        seen.add(key)
+        labels.push(label)
+      }
+    }
+
+    return labels
+  }
+
+  async function extractUnvisitedTabSections() {
+    const labels = discoverUnvisitedSectionLabels()
+    const sections = []
+
+    for (const label of labels) {
+      const key = normalizeKey(label)
+      const text = await extractSection({ key, title: label, matchers: [key] })
+
+      if (text) {
+        sections.push({ title: label, text })
+      }
+    }
+
+    return sections
+  }
+
   function sanitizeFallbackSnapshot(text) {
     const lines = normalizeText(text)
       .split('\n')
@@ -1321,11 +1394,7 @@
       return formatBreadcrumbsSection(section.text)
     }
 
-    if (['Request', 'User', 'Device', 'App', 'Metadata', 'Feature Flags'].includes(section.title)) {
-      return formatStructuredSection(section.title, section.text)
-    }
-
-    return `## ${section.title}\n\n${formatCodeBlock(section.text)}`
+    return formatStructuredSection(section.title, section.text)
   }
 
   function buildPrompt(result) {
@@ -1364,6 +1433,8 @@
         sections.push({ title: definition.title, text })
       }
     }
+
+    sections.push(...await extractUnvisitedTabSections())
 
     if (!sections.some((section) => section.title === 'Stack Trace')) {
       const fallbackStack = extractStackTraceFallback(document)

@@ -103,6 +103,18 @@
     return `${text.slice(0, maxLength)}\n… [truncated]`
   }
 
+  function getScopeRoot(scope = document) {
+    if (!scope) {
+      return document.body
+    }
+
+    if (scope instanceof Document) {
+      return scope.body || document.body
+    }
+
+    return scope
+  }
+
   function getPageType(url = location) {
     const pathname = typeof url === 'string' ? new URL(url).pathname : url.pathname
 
@@ -695,9 +707,10 @@
   }
 
   function collectSummaryStats(doc) {
+    const root = getScopeRoot(doc)
     const pairs = []
 
-    for (const term of doc.querySelectorAll('dt')) {
+    for (const term of root.querySelectorAll('dt')) {
       if (!isVisible(term) || !term.nextElementSibling) {
         continue
       }
@@ -710,7 +723,7 @@
       }
     }
 
-    for (const header of doc.querySelectorAll('th')) {
+    for (const header of root.querySelectorAll('th')) {
       const cell = header.parentElement?.querySelector('td')
 
       if (!isVisible(header) || !cell) {
@@ -725,7 +738,7 @@
       }
     }
 
-    const text = cleanBlockText(doc.body?.innerText || '', 20000)
+    const text = cleanBlockText(root.innerText || root.textContent || '', 20000)
 
     return SUMMARY_FIELDS.map((field) => {
       const fromPairs = pairs.find((pair) => field.matchers.includes(pair.label))
@@ -817,18 +830,19 @@
     }
   }
 
-  function findAssociatedPanel(control) {
+  function findAssociatedPanel(control, scopeRoot = document) {
     const controlsId = control.getAttribute('aria-controls')
+    const ownerDocument = control.ownerDocument || document
 
     if (controlsId) {
-      const panel = document.getElementById(controlsId)
+      const panel = ownerDocument.getElementById(controlsId)
       if (panel) {
         return panel
       }
     }
 
     if (control.id) {
-      const labelledPanel = document.querySelector(`[aria-labelledby~="${CSS.escape(control.id)}"]`)
+      const labelledPanel = ownerDocument.querySelector(`[aria-labelledby~="${CSS.escape(control.id)}"]`)
       if (labelledPanel) {
         return labelledPanel
       }
@@ -846,13 +860,14 @@
       }
     }
 
-    return findInformativeContainer(control)
+    return findInformativeContainer(control, scopeRoot)
   }
 
-  function findInformativeContainer(element) {
+  function findInformativeContainer(element, scopeRoot = document.body) {
     let current = element
+    const boundary = getScopeRoot(scopeRoot)
 
-    while (current && current !== document.body) {
+    while (current && current !== boundary && current !== document.body) {
       const text = cleanBlockText(current.innerText || current.textContent, 3000)
 
       if (text.length > 120 && text.length < 14000) {
@@ -860,6 +875,14 @@
       }
 
       current = current.parentElement
+    }
+
+    if (boundary && boundary !== document.body) {
+      const text = cleanBlockText(boundary.innerText || boundary.textContent, 3000)
+
+      if (text.length > 120 && text.length < 14000) {
+        return boundary
+      }
     }
 
     return null
@@ -913,8 +936,9 @@
     return snapshots
   }
 
-  async function extractSection(definition) {
-    const controls = findMatchingControls(document, definition.matchers)
+  async function extractSection(definition, scopeRoot = document) {
+    const root = getScopeRoot(scopeRoot)
+    const controls = findMatchingControls(root, definition.matchers)
 
     for (const control of controls) {
       const restoreTab = getSelectedTabPeer(control)
@@ -925,7 +949,7 @@
         control.click()
         await sleep(180)
 
-        const panel = findAssociatedPanel(control)
+        const panel = findAssociatedPanel(control, root)
 
         if (panel) {
           nestedSnapshots = await expandNestedContent(panel)
@@ -945,7 +969,7 @@
       }
     }
 
-    const heading = [...document.querySelectorAll(HEADING_SELECTOR)].find(
+    const heading = [...root.querySelectorAll(HEADING_SELECTOR)].find(
       (element) => isVisible(element) && matchesAny(element.innerText || element.textContent, definition.matchers),
     )
 
@@ -961,7 +985,8 @@
   }
 
   function extractStackTraceFallback(doc) {
-    const stackBlock = [...doc.querySelectorAll('pre, code')]
+    const root = getScopeRoot(doc)
+    const stackBlock = [...root.querySelectorAll('pre, code')]
       .filter(isVisible)
       .map((element) => cleanBlockText(element.innerText || element.textContent, 9000))
       .find((text) => /\bat\b.+:\d+/m.test(text) || /Exception|Error:/m.test(text))
@@ -970,7 +995,7 @@
       return stackBlock
     }
 
-    const lines = (doc.body?.innerText || '')
+    const lines = (root.innerText || root.textContent || '')
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => /\bat\b.+:\d+/i.test(line) || /https?:\/\/.+:\d+/i.test(line))
@@ -1011,6 +1036,12 @@
     /^snooze$/i,
     /^ignore$/i,
     /^comments & activity$/i,
+    /^events?(?:\s*\(\d+\))?$/i,
+    /^users?(?:\s*\(\d+\))?$/i,
+    /^release stages?(?:\s*\(\d+\))?$/i,
+    /^app types?(?:\s*\(\d+\))?$/i,
+    /^releases?(?:\s*\(\d+\))?$/i,
+    /^hosts?(?:\s*\(\d+\))?$/i,
     /^1h$/i,
     /^3h$/i,
     /^1d$/i,
@@ -1023,6 +1054,11 @@
     /^\d{1,3}\.\d%$/,
   ]
 
+  const CUSTOM_SECTION_NOISE_PATTERNS = [
+    /enable bugsnag performance monitoring/i,
+    /integrate our performance sdks/i,
+  ]
+
   function isFallbackNoiseLine(line) {
     const normalized = normalizeText(line)
 
@@ -1033,10 +1069,26 @@
     return FALLBACK_NOISE_PATTERNS.some((pattern) => pattern.test(normalized))
   }
 
-  function discoverUnvisitedSectionLabels() {
+  function isNoisyCustomSection(label, text) {
+    const normalizedLabel = normalizeKey(label)
+    const normalizedText = normalizeText(text)
+
+    if (!normalizedText) {
+      return true
+    }
+
+    if (normalizedLabel === 'trace' && CUSTOM_SECTION_NOISE_PATTERNS.some((pattern) => pattern.test(normalizedText))) {
+      return true
+    }
+
+    return false
+  }
+
+  function discoverUnvisitedSectionLabels(scopeRoot = document) {
+    const root = getScopeRoot(scopeRoot)
     const allMatchers = SECTION_DEFS.flatMap((def) => def.matchers)
 
-    const knownControls = [...document.querySelectorAll('button, [role="tab"], summary')]
+    const knownControls = [...root.querySelectorAll('button, [role="tab"], summary')]
       .filter((element) => isVisible(element) && matchesAny(element.innerText || element.textContent, allMatchers))
 
     // Need at least 2 known tabs to confirm we are looking at a tabbed section layout.
@@ -1090,15 +1142,15 @@
     return labels
   }
 
-  async function extractUnvisitedTabSections() {
-    const labels = discoverUnvisitedSectionLabels()
+  async function extractUnvisitedTabSections(scopeRoot = document) {
+    const labels = discoverUnvisitedSectionLabels(scopeRoot)
     const sections = []
 
     for (const label of labels) {
       const key = normalizeKey(label)
-      const text = await extractSection({ key, title: label, matchers: [key] })
+      const text = await extractSection({ key, title: label, matchers: [key] }, scopeRoot)
 
-      if (text) {
+      if (text && !isNoisyCustomSection(label, text)) {
         sections.push({ title: label, text })
       }
     }
@@ -1139,8 +1191,9 @@
       return ''
     }
 
+    const root = getScopeRoot(doc)
     const capturedText = capturedSections.map((section) => section.text).join('\n')
-    const pageText = sanitizeFallbackSnapshot(doc.body?.innerText || '')
+    const pageText = sanitizeFallbackSnapshot(root.innerText || root.textContent || '')
 
     if (!pageText) {
       return ''
@@ -1416,28 +1469,29 @@
     return blocks.join('\n\n')
   }
 
-  async function extractIssue() {
+  async function extractIssue(scopeRoot = document) {
+    const root = getScopeRoot(scopeRoot)
     const title = getMainTitle(document)
 
     if (!title && getPageType() !== 'issue') {
       throw new Error('Open an issue page, or choose an issue from the timeline first.')
     }
 
-    const stats = collectSummaryStats(document)
+    const stats = collectSummaryStats(root)
     const sections = []
 
     for (const definition of SECTION_DEFS) {
-      const text = await extractSection(definition)
+      const text = await extractSection(definition, root)
 
       if (text) {
         sections.push({ title: definition.title, text })
       }
     }
 
-    sections.push(...await extractUnvisitedTabSections())
+    sections.push(...await extractUnvisitedTabSections(root))
 
     if (!sections.some((section) => section.title === 'Stack Trace')) {
-      const fallbackStack = extractStackTraceFallback(document)
+      const fallbackStack = extractStackTraceFallback(root)
 
       if (fallbackStack) {
         sections.unshift({ title: 'Stack Trace', text: fallbackStack })
@@ -1447,7 +1501,7 @@
     const filteredSections = sections.filter(
       (section, index, all) => all.findIndex((candidate) => candidate.title === section.title) === index,
     )
-    const pageExcerpt = buildPageExcerpt(document, filteredSections)
+    const pageExcerpt = buildPageExcerpt(root, filteredSections)
 
     return {
       title: title || 'Issue',
@@ -1527,10 +1581,11 @@
       announce: false,
       titleOverride: getTimelineSelectionTitle(container),
       urlOverride: getTimelineSelectionUrl(container),
+      scopeRoot: container,
     })
   }
 
-  async function captureCurrentIssue({ announce = true, titleOverride = '', urlOverride = '' } = {}) {
+  async function captureCurrentIssue({ announce = true, titleOverride = '', urlOverride = '', scopeRoot = document } = {}) {
     if (announce) {
       openModal()
     }
@@ -1539,7 +1594,7 @@
 
     try {
       await waitForIssueContent()
-      const result = await extractIssue()
+      const result = await extractIssue(scopeRoot)
       if (titleOverride) {
         result.title = titleOverride
       }
@@ -1627,7 +1682,7 @@
       if (container) {
         const titleOverride = getTimelineSelectionTitle(container)
         const urlOverride = getTimelineSelectionUrl(container)
-        await captureCurrentIssue({ titleOverride, urlOverride })
+        await captureCurrentIssue({ titleOverride, urlOverride, scopeRoot: container })
         return { ok: true, pageType }
       }
 
